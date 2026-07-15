@@ -9740,6 +9740,170 @@ class Qwen3ASRModelPatcher(OVSeq2SeqModelPatcher):
             del self._model._orig_forward
 
 
+class FunASRModelPatcher(OVSeq2SeqModelPatcher):
+    """
+    Model patcher for FunASR (e.g. Fun-ASR-Nano) encoder-decoder export.
+
+    Encoder: SenseVoice audio encoder + adaptor. All frames are assumed valid (no masking)
+    because funasr's native mask ops use .tolist() which bakes trace-time constants.
+
+    Decoder: a standard Qwen3 LLM. The audio embeddings produced by the encoder are spliced into the
+    decoder input embeddings at audio placeholder positions (token id == audio_token_id, which is 0
+    for FunASR), then the Qwen3 LM runs with self-attention KV cache only (no cross-attention).
+    """
+
+    def __enter__(self):
+        super().__enter__()
+
+        if self.real_config._behavior == "encoder":
+            self._patch_audio_encoder()
+        elif self.real_config._behavior == "decoder":
+            self._patch_decoder()
+
+    def _patch_audio_encoder(self):
+        # self._model is the _FunASRAudioEncoder wrapper (audio_encoder + audio_adaptor)
+        encoder_wrap = self._model
+        sense_voice = encoder_wrap.audio_encoder
+        adaptor = encoder_wrap.audio_adaptor
+
+        # Patch SANM encoder self-attention layers to skip masking during trace.
+        # The native mask computation uses `lengths.tolist()` which bakes trace-time values as constants,
+        # making the graph incompatible with different sequence lengths at inference time.
+        self._sanm_layers = list(sense_voice.encoders0) + list(sense_voice.encoders) + list(sense_voice.tp_encoders)
+        self._adaptor_blocks = getattr(adaptor, "blocks", None)
+
+        def _sanm_forward_no_mask(self, x, mask=None, mask_shfit_chunk=None, mask_att_chunk_encoder=None):
+            return self._orig_forward(x, mask=None, mask_shfit_chunk=None, mask_att_chunk_encoder=None)
+
+        for layer in self._sanm_layers:
+            attn = layer.self_attn
+            attn._orig_forward = attn.forward
+            attn.forward = types.MethodType(_sanm_forward_no_mask, attn)
+
+        # Patch adaptor transformer attention layers similarly.
+        def _adaptor_forward_no_mask(self, query, key, value, mask=None):
+            return self._orig_forward(query, key, value, mask=None)
+
+        if self._adaptor_blocks is not None:
+            for block in self._adaptor_blocks:
+                attn = block.self_attn
+                attn._orig_forward = attn.forward
+                attn.forward = types.MethodType(_adaptor_forward_no_mask, attn)
+
+        encoder_wrap._orig_forward = encoder_wrap.forward
+
+        def patched_encoder_forward(input_features):
+            speech_lengths = torch.tensor([input_features.shape[1]] * input_features.shape[0], dtype=torch.int32)
+            encoder_out, encoder_out_lens = sense_voice(input_features, speech_lengths)
+            adaptor_out, _ = adaptor(encoder_out, encoder_out_lens)
+            return BaseModelOutput(last_hidden_state=adaptor_out)
+
+        encoder_wrap.forward = patched_encoder_forward
+
+    def _patch_decoder(self):
+        # self._model is the _FunASRForSpeechSeq2Seq wrapper
+        model = self._model
+        self._llm = model.llm
+        llm = self._llm
+        audio_token_id = getattr(model.config, "audio_token_id", 0)
+
+        # Force eager attention for stable OpenVINO tracing.
+        self._orig_attn_implementation = llm.config._attn_implementation
+        llm.set_attn_implementation("eager")
+
+        model._orig_forward = model.forward
+
+        def patched_decoder_forward(
+            encoder_outputs=None,
+            decoder_input_ids=None,
+            attention_mask=None,
+            past_key_values=None,
+            cache_position=None,
+            **kwargs,
+        ):
+            if past_key_values is not None and isinstance(past_key_values, (list, tuple)):
+                cache = DynamicCache()
+                for layer_past in past_key_values:
+                    if len(layer_past) >= 2:
+                        cache.update(layer_past[0], layer_past[1], len(cache))
+                past_key_values = cache
+            elif past_key_values is None:
+                past_key_values = DynamicCache()
+
+            input_ids = decoder_input_ids
+            inputs_embeds = llm.get_input_embeddings()(input_ids)
+
+            # Splice audio embeddings into placeholder positions (token id == audio_token_id).
+            if encoder_outputs is not None:
+                if isinstance(encoder_outputs, (tuple, list)):
+                    encoder_hidden_states = encoder_outputs[0]
+                else:
+                    encoder_hidden_states = encoder_outputs
+                audio_features = encoder_hidden_states.reshape(-1, encoder_hidden_states.shape[-1])
+                audio_features = audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
+
+                special_audio_mask = input_ids == audio_token_id  # [batch, seq]
+                audio_cumsum = special_audio_mask.long().cumsum(dim=-1) - 1
+                audio_cumsum = audio_cumsum.clamp(min=0)
+                gather_indices = audio_cumsum.unsqueeze(-1).expand(-1, -1, inputs_embeds.shape[-1])
+                audio_features_expanded = audio_features.unsqueeze(0).expand(inputs_embeds.shape[0], -1, -1)
+                gathered_audio = torch.gather(audio_features_expanded, 1, gather_indices)
+                mask_3d = special_audio_mask.unsqueeze(-1)
+                inputs_embeds = torch.where(mask_3d, gathered_audio, inputs_embeds)
+
+            outputs = llm.model(
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=True,
+                cache_position=cache_position,
+            )
+
+            logits = llm.lm_head(outputs[0])
+
+            past_kv = outputs.past_key_values
+            flat_output = [logits]
+            if isinstance(past_kv, DynamicCache):
+                for layer in past_kv.layers:
+                    flat_output.append(layer.keys)
+                    flat_output.append(layer.values)
+            elif past_kv is not None:
+                legacy = past_kv if isinstance(past_kv, (list, tuple)) else past_kv.to_legacy_cache()
+                for layer_kv in legacy:
+                    flat_output.append(layer_kv[0])
+                    flat_output.append(layer_kv[1])
+
+            return tuple(flat_output)
+
+        model.forward = patched_decoder_forward
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        super().__exit__(exc_type, exc_value, traceback)
+
+        if hasattr(self._model, "_orig_forward"):
+            self._model.forward = self._model._orig_forward
+            del self._model._orig_forward
+
+        # Restore attention implementation on the LLM.
+        if getattr(self, "_llm", None) is not None and getattr(self, "_orig_attn_implementation", None) is not None:
+            self._llm.set_attn_implementation(self._orig_attn_implementation)
+
+        # Unpatch SANM and adaptor attention layers.
+        if getattr(self, "_sanm_layers", None) is not None:
+            for layer in self._sanm_layers:
+                attn = layer.self_attn
+                if hasattr(attn, "_orig_forward"):
+                    attn.forward = attn._orig_forward
+                    del attn._orig_forward
+
+        if getattr(self, "_adaptor_blocks", None) is not None:
+            for block in self._adaptor_blocks:
+                attn = block.self_attn
+                if hasattr(attn, "_orig_forward"):
+                    attn.forward = attn._orig_forward
+                    del attn._orig_forward
+
+
 class KokoroModelPatcher(ModelPatcher):
     """
     Patches the Kokoro TTS model for OpenVINO export by redirecting forward

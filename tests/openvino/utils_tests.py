@@ -305,6 +305,7 @@ HUB_MODEL_NAMES = {
     "qwen3_5": "optimum-intel-internal-testing/tiny-random-qwen3.5",
     "qwen3_5_moe": "optimum-intel-internal-testing/tiny-random-qwen3.5-moe",
     "qwen3_asr": "optimum-intel-internal-testing/tiny-random-qwen3-asr",
+    "fun_asr": "optimum-intel-internal-testing/tiny-random-fun-asr",
     "rembert": "optimum-intel-internal-testing/tiny-random-rembert",
     "resnet": "optimum-intel-internal-testing/tiny-random-resnet",
     "roberta": "optimum-intel-internal-testing/tiny-random-roberta",
@@ -613,6 +614,11 @@ _ARCHITECTURES_TO_EXPECTED_INT8 = {
         "decoder": 30,
         "decoder_with_past": 30,
     },
+    "fun_asr": {
+        "encoder": 46,
+        "decoder": 30,
+        "decoder_with_past": 30,
+    },
 }
 
 TEST_IMAGE_URL = "http://images.cocodataset.org/val2017/000000039769.jpg"
@@ -641,6 +647,7 @@ REMOTE_CODE_MODELS = (
     "qwen3_eagle3",
     "qwen3_vl_eagle3",
     "qwen3_asr",
+    "fun_asr",
     "videochat_flash_qwen",
 )
 
