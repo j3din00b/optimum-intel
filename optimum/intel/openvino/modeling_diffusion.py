@@ -87,9 +87,10 @@ else:
 
 # Required EncoderDecoderCache object from transformers
 if is_diffusers_version(">=", "0.32"):
-    from diffusers import LTXPipeline
+    from diffusers import LTXImageToVideoPipeline, LTXPipeline
 else:
     LTXPipeline = object
+    LTXImageToVideoPipeline = object
 
 if is_diffusers_version(">=", "0.38.0"):
     from diffusers import LTX2Pipeline
@@ -793,11 +794,13 @@ class OVDiffusionPipeline(OVBaseModel, DiffusionPipeline):
             if "img_ids" not in {inputs.get_any_name() for inputs in model.inputs}:
                 batch_size *= 2
 
-        is_ltx = self.__class__.__name__.startswith("OVLTX")
+        is_ltx = getattr(self, "_is_ltx_pipeline", False)
         is_flux2 = self.__class__.__name__.startswith("OVFlux2")
         if is_ltx:
             height = height // self.vae_spatial_compression_ratio if height > 0 else -1
             width = width // self.vae_spatial_compression_ratio if width > 0 else -1
+            if num_frames > 0:
+                num_frames = (num_frames - 1) // self.vae_temporal_compression_ratio + 1
             packed_height_width = width * height * num_frames if height > 0 and width > 0 and num_frames > 0 else -1
         else:
             height = height // self.vae_scale_factor if height > 0 else height
@@ -811,6 +814,8 @@ class OVDiffusionPipeline(OVBaseModel, DiffusionPipeline):
             shapes[inputs] = inputs.get_partial_shape()
             if inputs.get_any_name() in ["timestep", "guidance"]:
                 shapes[inputs][0] = batch_size
+                if is_ltx and len(shapes[inputs]) == 2:
+                    shapes[inputs][1] = packed_height_width
             elif inputs.get_any_name() == "hidden_states":
                 in_channels = self.transformer.config.get("in_channels", None)
                 if in_channels is None:
@@ -871,6 +876,8 @@ class OVDiffusionPipeline(OVBaseModel, DiffusionPipeline):
                     "Could not identify `in_channels` from the VAE encoder configuration, to statically reshape the VAE encoder please provide a configuration."
                 )
                 self.is_dynamic = True
+        if getattr(self, "_vae_encoder_single_frame", False):
+            num_frames = 1
         shapes = {
             model.inputs[0]: (
                 [batch_size, in_channels, height, width]
@@ -889,10 +896,12 @@ class OVDiffusionPipeline(OVBaseModel, DiffusionPipeline):
         num_images_per_prompt: int = -1,
         num_frames: int = -1,
     ):
-        is_ltx = self.__class__.__name__.startswith("OVLTX")
+        is_ltx = getattr(self, "_is_ltx_pipeline", False)
         if is_ltx:
             height = height // self.vae_spatial_compression_ratio if height > 0 else -1
             width = width // self.vae_spatial_compression_ratio if width > 0 else -1
+            if num_frames > 0:
+                num_frames = (num_frames - 1) // self.vae_temporal_compression_ratio + 1
         else:
             height = height // self.vae_scale_factor if height > -1 else height
             width = width // self.vae_scale_factor if width > -1 else width
@@ -965,7 +974,7 @@ class OVDiffusionPipeline(OVBaseModel, DiffusionPipeline):
                 (
                     getattr(self.tokenizer, "model_max_length", -1)
                     if "Gemma" not in self.tokenizer.__class__.__name__
-                    and not self.__class__.__name__.startswith("OVLTX")
+                    and not getattr(self, "_is_ltx_pipeline", False)
                     else -1
                 ),
             )
@@ -1892,16 +1901,57 @@ class OVSanaSprintPipeline(OVDiffusionPipeline, OVTextualInversionLoaderMixin, S
     auto_model_class = SanaSprintPipeline
 
 
+class OVModelLTXTransformer(OVModelTransformer):
+    def forward(self, hidden_states, timestep=None, **kwargs):
+        # T2V passes a scalar timestep [B]; the IR expects [B, S] where hidden_states is [B, S, C] and
+        # S = num_frames * height * width in patch space. Broadcast so every token gets the same noise level.
+        if timestep is not None and timestep.ndim == 1 and self._timestep_rank == 2:
+            timestep = timestep.unsqueeze(-1).expand(-1, hidden_states.shape[1]).contiguous()
+        return super().forward(hidden_states=hidden_states, timestep=timestep, **kwargs)
+
+    @property
+    def _timestep_rank(self):
+        for inp in self.model.inputs:
+            if "timestep" in inp.get_any_name():
+                return len(inp.partial_shape)
+        return 1
+
+
 class OVLTXPipeline(OVDiffusionPipeline, OVTextualInversionLoaderMixin, LTXPipeline):
     main_input_name = "prompt"
     export_feature = "text-to-video"
     auto_model_class = LTXPipeline
+    _is_ltx_pipeline = True
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.transformer is not None:
+            self.transformer.__class__ = OVModelLTXTransformer
+
+
+class OVLTXImageToVideoPipeline(OVDiffusionPipeline, OVTextualInversionLoaderMixin, LTXImageToVideoPipeline):
+    main_input_name = "image"
+    export_feature = "image-to-video"
+    auto_model_class = LTXImageToVideoPipeline
+    _is_ltx_pipeline = True
+    _vae_encoder_single_frame = True
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.transformer is not None:
+            self.transformer.__class__ = OVModelLTXTransformer
+
+    def __call__(self, image=None, **kwargs):
+        if image is None:
+            raise ValueError("`image` is required for image-to-video generation.")
+        return super().__call__(image=image, **kwargs)
 
 
 class OVLTX2Pipeline(OVDiffusionPipeline, OVTextualInversionLoaderMixin, LTX2Pipeline):
     main_input_name = "prompt"
     export_feature = "text-to-video"
     auto_model_class = LTX2Pipeline
+    _is_ltx_pipeline = True
 
     def __init__(
         self,
@@ -2183,10 +2233,13 @@ OV_INPAINT_PIPELINES_MAPPING = OrderedDict(
 )
 
 OV_TEXT2VIDEO_PIPELINES_MAPPING = OrderedDict()
+OV_IMAGE2VIDEO_PIPELINES_MAPPING = OrderedDict()
 
 if is_diffusers_version(">=", "0.32"):
     OV_TEXT2VIDEO_PIPELINES_MAPPING["ltx-video"] = OVLTXPipeline
+    OV_IMAGE2VIDEO_PIPELINES_MAPPING["ltx-video"] = OVLTXImageToVideoPipeline
     SUPPORTED_OV_PIPELINES.append(OVLTXPipeline)
+    SUPPORTED_OV_PIPELINES.append(OVLTXImageToVideoPipeline)
 
 if is_diffusers_version(">=", "0.38.0"):
     OV_TEXT2VIDEO_PIPELINES_MAPPING["ltx2"] = OVLTX2Pipeline
@@ -2234,6 +2287,7 @@ SUPPORTED_OV_PIPELINES_MAPPINGS = [
     OV_IMAGE2IMAGE_PIPELINES_MAPPING,
     OV_INPAINT_PIPELINES_MAPPING,
     OV_TEXT2VIDEO_PIPELINES_MAPPING,
+    OV_IMAGE2VIDEO_PIPELINES_MAPPING,
 ]
 
 
@@ -2304,3 +2358,9 @@ class OVPipelineForText2Video(OVPipelineForTask):
     auto_model_class = DiffusionPipeline
     ov_pipelines_mapping = OV_TEXT2VIDEO_PIPELINES_MAPPING
     export_feature = "text-to-video"
+
+
+class OVPipelineForImage2Video(OVPipelineForTask):
+    auto_model_class = DiffusionPipeline
+    ov_pipelines_mapping = OV_IMAGE2VIDEO_PIPELINES_MAPPING
+    export_feature = "image-to-video"
