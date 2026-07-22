@@ -305,6 +305,7 @@ HUB_MODEL_NAMES = {
     "qwen3_5": "optimum-intel-internal-testing/tiny-random-qwen3.5",
     "qwen3_5_moe": "optimum-intel-internal-testing/tiny-random-qwen3.5-moe",
     "qwen3_asr": "optimum-intel-internal-testing/tiny-random-qwen3-asr",
+    "qwen3_dflash": "optimum-intel-internal-testing/tiny-random-qwen3-dflash",
     "fun_asr": "optimum-intel-internal-testing/tiny-random-fun-asr",
     "rembert": "optimum-intel-internal-testing/tiny-random-rembert",
     "resnet": "optimum-intel-internal-testing/tiny-random-resnet",
@@ -387,6 +388,13 @@ def _resolve_cached_model_paths(model_names: dict) -> dict:
 MODEL_NAMES = _resolve_cached_model_paths(HUB_MODEL_NAMES)
 
 EAGLE3_MODELS = {"qwen3_eagle3": ("AngelSlim/Qwen3-1.7B_eagle3", "Qwen/Qwen3-1.7B")}
+
+DFLASH_MODELS = {
+    "qwen3_dflash": (
+        "optimum-intel-internal-testing/tiny-random-qwen3-dflash",
+        "optimum-intel-internal-testing/tiny-random-qwen3",
+    )
+}
 
 # VLM-based Eagle3 draft models (AngelSlim Eagle3LlamaForCausalLM architecture).
 # These use Qwen3-VL MRoPE and target VLM models for speculative decoding.
@@ -591,6 +599,7 @@ _ARCHITECTURES_TO_EXPECTED_INT8 = {
     "lfm2_moe": {"model": 46},
     "hunyuan_v1_dense": {"model": 32},
     "qwen3_eagle3": {"model": 20},
+    "qwen3_dflash": {"model": 30},
     "qwen3_vl_eagle3": {"model": 18},
     "qwen3_next": {"model": 100},
     "gemma3n": {
@@ -652,6 +661,7 @@ REMOTE_CODE_MODELS = (
     "decilm",
     "minicpm3",
     "deepseek",
+    "qwen3_dflash",
     "qwen3_eagle3",
     "qwen3_vl_eagle3",
     "qwen3_asr",
@@ -832,6 +842,7 @@ TEST_NAME_TO_MODEL_TYPE = {
     "opt_gptq": "opt",
     "perceiver_text": "perceiver",
     "perceiver_vision": "perceiver",
+    "qwen3_dflash": "qwen3",
     "qwen3_vl_embedding": "qwen3_vl",
     "swin-window": "swin",
     "vit-with-attentions": "vit",
